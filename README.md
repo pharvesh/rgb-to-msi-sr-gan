@@ -24,3 +24,6 @@ Pillow>=8.3.0
 scikit-learn>=0.24.0
 tqdm>=4.62.0
 ```
+
+
+⚠️ Note: Dataset paths in config.yaml are placeholders. Please update them with actual directories before running training. Dataset files are not included in this repository.
