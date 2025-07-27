@@ -2,255 +2,188 @@
 """
 Training Script for RGB to Multispectral Image Super-Resolution
 
-This script handles the complete training pipeline including model initialization,
-data loading, training loop, and checkpointing.
-
-Usage:
-    python scripts/train.py --config configs/default_config.yaml
-    python scripts/train.py --config configs/custom_config.yaml --resume checkpoints/latest.pt
-
 """
 
-import argparse
-import logging
 import os
-import sys
-import torch
 import yaml
-from pathlib import Path
+import torch
+import logging
+from torch.utils.data import DataLoader
+from models.generator import ResAttUNetGenerator
+from models.discriminator import PatchGANDiscriminator
+from utils.datasets import RGBToMSIDataset
+from utils.losses import GANLoss, L1Loss, SAMLoss, PerceptualLoss
+from utils.early_stopping import EarlyStopping
+from utils.metrics import compute_metrics
+from utils.weight_init import initialize_weights
+from torchvision.utils import save_image
+from torch.optim import Adam
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 import numpy as np
-from datetime import datetime
+import random
 
-# Add src to Python path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# ------------------------------- Utility Functions ------------------------------- #
 
-from src.models.generator import ResAttentionUNet
-from src.models.discriminator import PatchGANDiscriminator
-from src.data.dataset import create_dataloaders
-from src.utils.config import load_config, validate_config
-from src.utils.logging_utils import setup_logging
-from scripts.trainer import GANTrainer
-from scripts.utils import set_seed, save_config, create_checkpoint_dir
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
+def get_device(config):
+    if config["hardware"]["device"] == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(config["hardware"]["device"])
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description='Train RGB to Multispectral Image Super-Resolution GAN'
-    )
-    
-    parser.add_argument(
-        '--config', 
-        type=str, 
-        required=True,
-        help='Path to configuration YAML file'
-    )
-    
-    parser.add_argument(
-        '--resume', 
-        type=str, 
-        default=None,
-        help='Path to checkpoint to resume training from'
-    )
-    
-    parser.add_argument(
-        '--output-dir', 
-        type=str, 
-        default='experiments',
-        help='Base directory for experiment outputs'
-    )
-    
-    parser.add_argument(
-        '--experiment-name', 
-        type=str, 
-        default=None,
-        help='Name for this experiment (default: auto-generated)'
-    )
-    
-    parser.add_argument(
-        '--debug', 
-        action='store_true',
-        help='Enable debug mode with additional logging'
-    )
-    
-    parser.add_argument(
-        '--dry-run', 
-        action='store_true',
-        help='Perform a dry run without actual training'
-    )
-    
-    return parser.parse_args()
+def load_config(config_path):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
 
+# ------------------------------- Main Training ------------------------------- #
 
-def setup_experiment_dir(base_dir: str, experiment_name: str = None) -> Path:
-    """Create experiment directory structure."""
-    if experiment_name is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        experiment_name = f"rgb2ms_gan_{timestamp}"
-    
-    exp_dir = Path(base_dir) / experiment_name
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create subdirectories
-    (exp_dir / 'checkpoints').mkdir(exist_ok=True)
-    (exp_dir / 'logs').mkdir(exist_ok=True)
-    (exp_dir / 'config').mkdir(exist_ok=True)
-    (exp_dir / 'results').mkdir(exist_ok=True)
-    
-    return exp_dir
+def train(config):
 
+    # Setup
+    set_seed(config["seed"])
+    os.makedirs(config["checkpoint"]["save_dir"], exist_ok=True)
+    os.makedirs(config["logging"]["log_dir"], exist_ok=True)
+    device = get_device(config)
 
-def initialize_models(config: dict, device: torch.device) -> tuple:
-    """Initialize generator and discriminator models."""
-    model_config = config['model']
-    
-    # Initialize generator
-    generator = ResAttentionUNet(
-        n_channels=model_config['input_channels'],
-        n_classes=model_config['output_channels'],
-        base_features=model_config['base_unet_features'],
-        bilinear=model_config.get('bilinear_upsampling', True)
-    ).to(device)
-    
-    # Initialize discriminator
-    discriminator = PatchGANDiscriminator(
-        in_channels=model_config['input_channels'] + model_config['output_channels'],
-        features_d=model_config['disc_features']
-    ).to(device)
-    
-    # Initialize weights
-    generator.initialize_weights()
-    discriminator.initialize_weights()
-    
-    return generator, discriminator
+    writer = SummaryWriter(config["logging"]["log_dir"])
+    logging.basicConfig(level=logging.getLevelName(config["logging"]["log_level"]))
 
+    # Datasets and Loaders
+    train_dataset = RGBToMSIDataset(config["data"], split="train")
+    val_dataset = RGBToMSIDataset(config["data"], split="val")
 
-def main():
-    """Main training function."""
-    # Parse arguments
-    args = parse_args()
-    
-    # Load and validate configuration
-    config = load_config(args.config)
-    validate_config(config)
-    
-    # Set random seed for reproducibility
-    if 'seed' in config:
-        set_seed(config['seed'])
-    
-    # Setup experiment directory
-    exp_dir = setup_experiment_dir(args.output_dir, args.experiment_name)
-    
-    # Setup logging
-    log_file = exp_dir / 'logs' / 'training.log'
-    logger = setup_logging(log_file, debug=args.debug)
-    
-    logger.info("="*60)
-    logger.info("RGB to Multispectral Image Super-Resolution Training")
-    logger.info("="*60)
-    logger.info(f"Experiment directory: {exp_dir}")
-    logger.info(f"Configuration file: {args.config}")
-    
-    # Save configuration to experiment directory
-    config_save_path = exp_dir / 'config' / 'config.yaml'
-    save_config(config, config_save_path)
-    
-    # Determine device
-    if config.get('hardware', {}).get('device') == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(config.get('hardware', {}).get('device', 'cpu'))
-    
-    logger.info(f"Using device: {device}")
-    
-    if device.type == 'cuda':
-        logger.info(f"GPU: {torch.cuda.get_device_name()}")
-        logger.info(f"CUDA Version: {torch.version.cuda}")
-        logger.info(f"Available GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    
-    try:
-        # Create data loaders
-        logger.info("Creating data loaders...")
-        train_loader, val_loader = create_dataloaders(config)
-        logger.info(f"Training samples: {len(train_loader.dataset)}")
-        logger.info(f"Validation samples: {len(val_loader.dataset)}")
-        logger.info(f"Training batches per epoch: {len(train_loader)}")
-        
-        # Initialize models
-        logger.info("Initializing models...")
-        generator, discriminator = initialize_models(config, device)
-        
-        logger.info(f"Generator parameters: {generator.get_num_parameters():,}")
-        logger.info(f"Discriminator parameters: {discriminator.get_num_parameters():,}")
-        
-        # Update config with experiment directory paths
-        config['checkpoint']['save_dir'] = str(exp_dir / 'checkpoints')
-        config['logging']['log_dir'] = str(exp_dir / 'logs')
-        
-        # Initialize trainer
-        logger.info("Initializing trainer...")
-        trainer = GANTrainer(
-            generator=generator,
-            discriminator=discriminator,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            config=config,
-            device=device,
-            logger=logger
-        )
-        
-        # Resume from checkpoint if specified
-        if args.resume:
-            logger.info(f"Resuming training from {args.resume}")
-            trainer.load_checkpoint(args.resume)
-        
-        # Dry run check
-        if args.dry_run:
-            logger.info("Dry run mode - skipping actual training")
-            logger.info("Configuration and model initialization successful")
-            return
-        
-        # Start training
-        logger.info("Starting training...")
-        training_history = trainer.train()
-        
-        # Save final results
-        logger.info("Saving final results...")
-        
-        # Save final model
-        final_model_path = exp_dir / 'checkpoints' / 'final_model.pt'
-        torch.save({
-            'generator_state_dict': generator.state_dict(),
-            'discriminator_state_dict': discriminator.state_dict(),
-            'config': config,
-            'training_history': training_history
-        }, final_model_path)
-        
-        # Save training history
-        history_path = exp_dir / 'results' / 'training_history.json'
-        trainer.save_training_history(history_path)
-        
-        logger.info(f"Training completed successfully!")
-        logger.info(f"Final model saved to: {final_model_path}")
-        logger.info(f"Training history saved to: {history_path}")
-        logger.info(f"All outputs saved to: {exp_dir}")
-        
-    except KeyboardInterrupt:
-        logger.info("Training interrupted by user")
-        
-        # Save current state
-        if 'trainer' in locals():
-            interrupt_path = exp_dir / 'checkpoints' / 'interrupted.pt'
-            trainer.save_checkpoint(interrupt_path)
-            logger.info(f"Current state saved to: {interrupt_path}")
-        
-        sys.exit(0)
-        
-    except Exception as e:
-        logger.error(f"Training failed with error: {e}")
-        logger.exception("Full traceback:")
-        sys.exit(1)
+    train_loader = DataLoader(train_dataset, batch_size=config["training"]["batch_size"],
+                              shuffle=True, num_workers=config["data"]["num_workers"],
+                              pin_memory=config["data"]["pin_memory"])
+    val_loader = DataLoader(val_dataset, batch_size=config["training"]["val_batch_size"],
+                            shuffle=False, num_workers=config["data"]["num_workers"],
+                            pin_memory=config["data"]["pin_memory"])
+
+    # Models
+    gen = ResAttUNetGenerator(in_channels=config["model"]["input_channels"],
+                              out_channels=config["model"]["output_channels"],
+                              base_features=config["model"]["base_unet_features"],
+                              bilinear=config["model"]["bilinear_upsampling"]).to(device)
+    disc = PatchGANDiscriminator(in_channels=config["model"]["input_channels"] +
+                                               config["model"]["output_channels"],
+                                 features_d=config["model"]["disc_features"]).to(device)
+
+    initialize_weights(gen)
+    initialize_weights(disc)
+
+    # Losses
+    gan_loss_fn = GANLoss().to(device)
+    l1_loss_fn = L1Loss().to(device)
+    sam_loss_fn = SAMLoss().to(device)
+    perceptual_loss_fn = PerceptualLoss().to(device)
+
+    # Optimizers
+    opt_g = Adam(gen.parameters(), lr=config["training"]["initial_lr_g"], betas=(0.5, 0.999))
+    opt_d = Adam(disc.parameters(), lr=config["training"]["initial_lr_d"], betas=(0.5, 0.999))
+
+    # Learning rate schedulers
+    def lr_lambda(epoch):
+        start_decay = int(config["training"]["num_epochs"] * config["training"]["lr_decay_start_ratio"])
+        if epoch < start_decay:
+            return 1.0
+        return max(config["training"]["min_lr"] / config["training"]["initial_lr_g"],
+                   1 - (epoch - start_decay) / (config["training"]["num_epochs"] - start_decay))
+
+    scheduler_g = torch.optim.lr_scheduler.LambdaLR(opt_g, lr_lambda)
+    scheduler_d = torch.optim.lr_scheduler.LambdaLR(opt_d, lr_lambda)
+
+    # Early Stopping
+    early_stopper = EarlyStopping(patience=config["training"]["patience"],
+                                  mode=config["checkpoint"]["mode"],
+                                  monitor=config["checkpoint"]["monitor"],
+                                  save_path=os.path.join(config["checkpoint"]["save_dir"],
+                                                         config["checkpoint"]["filename"]))
+
+    # Training Loop
+    for epoch in range(config["training"]["num_epochs"]):
+        gen.train()
+        disc.train()
+
+        epoch_g_loss = 0
+        epoch_d_loss = 0
+
+        for i, (rgb, ms) in enumerate(tqdm(train_loader)):
+            rgb, ms = rgb.to(device), ms.to(device)
+
+            #######################
+            # Train Discriminator #
+            #######################
+            for _ in range(config["training"]["d_update_freq"]):
+                fake_ms = gen(rgb).detach()
+                d_real = disc(torch.cat([rgb, ms], dim=1))
+                d_fake = disc(torch.cat([rgb, fake_ms], dim=1))
+                d_loss = gan_loss_fn(d_real, True, config["training"]["label_smooth_real"]) + \
+                         gan_loss_fn(d_fake, False, config["training"]["label_smooth_fake"])
+
+                opt_d.zero_grad()
+                d_loss.backward()
+                torch.nn.utils.clip_grad_norm_(disc.parameters(), config["training"]["grad_clip_norm"])
+                opt_d.step()
+
+            ###################
+            # Train Generator #
+            ###################
+            fake_ms = gen(rgb)
+            g_fake = disc(torch.cat([rgb, fake_ms], dim=1))
+
+            l1 = l1_loss_fn(fake_ms, ms)
+            sam = sam_loss_fn(fake_ms, ms)
+            adv = gan_loss_fn(g_fake, True)
+            perc = perceptual_loss_fn(fake_ms, ms)
+
+            g_loss = config["training"]["lambda_l1"] * l1 + \
+                     config["training"]["lambda_sam"] * sam + \
+                     config["training"]["lambda_adv"] * adv + \
+                     perc
+
+            opt_g.zero_grad()
+            g_loss.backward()
+            torch.nn.utils.clip_grad_norm_(gen.parameters(), config["training"]["grad_clip_norm"])
+            opt_g.step()
+
+            epoch_g_loss += g_loss.item()
+            epoch_d_loss += d_loss.item()
+
+        scheduler_g.step()
+        scheduler_d.step()
+
+        # Validation
+        gen.eval()
+        val_losses = []
+        with torch.no_grad():
+            for rgb, ms in val_loader:
+                rgb, ms = rgb.to(device), ms.to(device)
+                fake_ms = gen(rgb)
+                l1 = l1_loss_fn(fake_ms, ms)
+                val_losses.append(l1.item())
+
+        avg_val_loss = np.mean(val_losses)
+        writer.add_scalar("Loss/train_generator", epoch_g_loss / len(train_loader), epoch)
+        writer.add_scalar("Loss/train_discriminator", epoch_d_loss / len(train_loader), epoch)
+        writer.add_scalar("Loss/val_reconstruction", avg_val_loss, epoch)
+
+        logging.info(f"Epoch {epoch} | G Loss: {epoch_g_loss:.4f} | D Loss: {epoch_d_loss:.4f} | Val L1: {avg_val_loss:.4f}")
+
+        early_stopper.step(avg_val_loss, gen)
+        if early_stopper.early_stop:
+            logging.info("Early stopping triggered.")
+            break
+
+    writer.close()
+    logging.info("Training Complete.")
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    config = load_config("config/config.yaml")
+    train(config)
