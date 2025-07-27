@@ -49,7 +49,8 @@ data:
   spectral_extension: ".mat"
   num_workers: 4
   pin_memory: true
-  normalize_range: [-1, 1]
+  normalize_range: [-1, 1]   
+  dataset_available: false  # Set true after adding the data path
 
 
 
