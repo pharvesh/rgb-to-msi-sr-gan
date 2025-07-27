@@ -38,8 +38,8 @@ training:
 
 
 # Data Configuration
-data:
-  train_path: "/path/to/train/folder"
+data: 
+  train_path: "/path/to/train/folder"       # replace with the data path
   val_path: "/path/to/validation/folder"
   rgb_subdir: "Train_RGB"
   spectral_subdir: "Train_Spectral"
